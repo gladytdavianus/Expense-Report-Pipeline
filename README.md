@@ -14,6 +14,7 @@ Phone-based expense reporting. AppSheet collects the income and expense items, G
 8. [Troubleshooting](#8-troubleshooting)
 9. [Repository hygiene](#9-repository-hygiene)
 10. [Limitations and open decisions](#10-limitations-and-open-decisions)
+11. [Appendix: Apps Script code](#11-appendix-apps-script-code)
 
 ---
 
@@ -169,12 +170,14 @@ An income item fills `Pemasukan` and leaves `Pengeluaran` at 0. An expense item 
 
 ## 4. Setup
 
+Do the setup in Google Sheets in a computer browser at `sheets.google.com`. The Google Sheets app on iPhone and Android has no **Extensions** menu and no **File > Settings**, so you cannot paste the script, add the trigger, or set the time zone from the phone. After setup, use the phone for AppSheet only.
+
 ### Part 1: Drive folder and template
 
 1. Create the Drive folder `Expense`. Copy its ID from the address bar (the text after `/folders/`).
 2. Upload `Form_Expense_CV_Agam_Prima_Sukses_V2.xlsx`. Right-click it, choose **Open with > Google Sheets**, and choose **File > Save as Google Sheets**.
 3. Rename the result to `TEMPLATE Expense`. Copy its ID (the text between `/d/` and `/edit`).
-4. Keep the tab name `Expense Report`. Delete the uploaded `.xlsx`.
+4. Check that the file title has no **.XLSX** label. A file with the label is still an Excel file, and its menus and time zone setting are limited. Keep the tab name `Expense Report`. Delete the uploaded `.xlsx`.
 5. In **File > Settings**, set the time zone to `(GMT+07:00) Jakarta`.
 
 ### Part 2: Google Sheet `Data Expense`
@@ -195,7 +198,7 @@ An income item fills `Pemasukan` and leaves `Pengeluaran` at 0. An expense item 
 
 ### Part 4: Apps Script
 
-1. In `Data Expense`, open **Extensions > Apps Script**. Delete the default code and paste the contents of [`Code.gs`](Code.gs).
+1. In `Data Expense`, open **Extensions > Apps Script**. Delete the default code and paste the code from the [appendix](#11-appendix-apps-script-code). The repository file [`Code.gs`](Code.gs) holds the same code.
 2. Set `ROOT_FOLDER_ID` to the `Expense` folder ID and `TEMPLATE_ID` to the `TEMPLATE Expense` ID.
 3. Open **Project Settings** and set the time zone to `Asia/Jakarta`.
 4. Select `syncAll` and click **Run**. Grant access: **Advanced > Go to project (unsafe) > Allow**.
@@ -303,6 +306,7 @@ For each case, check:
 | No file appears | Missing required field, no items, or no trigger | Fill `Perusahaan`, `Nama Pekerjaan`, `Tanggal Laporan`. Add one item. Check **Triggers**. Open **Executions** for errors |
 | `Cannot read properties of null` in Executions | A tab name in the config does not match the sheet | Match `REPORT_SHEET`, `ITEM_SHEET` and `TEMPLATE_SHEET` to the real tab names |
 | Authorization error | Script access not granted | Run `syncAll` from the editor and grant access |
+| **Extensions** or **File > Settings** is missing | You opened the sheet in the mobile app, or the file is still `.xlsx` | Open `sheets.google.com` in a computer browser. For an `.xlsx` file, choose **File > Save as Google Sheets** and use the converted file |
 | Date is one day off | Old script version, or the time zone differs between the sheet and the template | Use the current `Code.gs`. Set Jakarta time zone in `Data Expense`, in `TEMPLATE Expense`, and in the Apps Script project settings. Force a rebuild (see below) |
 | A report does not rebuild after a script fix | The data and hash did not change | In the `Map` tab, clear the `Signature` cell of that report and run `syncAll` |
 | A second copy of a report appears | Someone deleted the `Map` row for that report | Restore the row, or trash the older file by hand |
@@ -347,3 +351,262 @@ Suggested repository layout:
 | Template layout | The script depends on the template cell map in [Report template](#3-report-template). If the layout changes, update the layout constants and `fillReport_` |
 | Output formats | The script exports `.xlsx`. PDF export needs an added export call |
 | Approver | `Disetujui Oleh` prints a typed name. The report has no signature capture |
+
+## 11. Appendix: Apps Script code
+
+Paste this code into the Apps Script editor of `Data Expense`, then replace the two placeholder IDs in the config block. The repository file `Code.gs` holds the same code. When you change one copy, change the other.
+
+```javascript
+// Expense report builder
+// Reads tabs "Laporan" and "Item", copies the template, resizes the item block,
+// rewrites the total formulas, and exports an .xlsx next to the Google Sheet.
+
+// Config: replace with your own values
+const ROOT_FOLDER_ID = 'PASTE_ROOT_FOLDER_ID';          // Drive folder "Expense"
+const TEMPLATE_ID    = 'PASTE_TEMPLATE_SPREADSHEET_ID'; // Google Sheets copy of the template
+const TEMPLATE_SHEET = 'Expense Report';                // tab name inside the template
+const REPORT_SHEET   = 'Laporan';
+const ITEM_SHEET     = 'Item';
+const MAP_SHEET      = 'Map';                           // created by the script, do not edit by hand
+const EXPORT_XLSX    = true;
+
+// Template layout (matches Form_Expense_CV_Agam_Prima_Sukses_V2.xlsx)
+const FIRST_ITEM_ROW      = 9;
+const TEMPLATE_ITEM_ROWS  = 10;   // rows 9 to 18 in the template
+const SIGNATURE_NAME_ROW  = 27;   // row of "( ___ )" in the template
+const ROW_COLORS = ['#FFFFFF', '#F4F8FB'];
+
+const MONTHS = ['Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni', 'Juli',
+                'Agustus', 'September', 'Oktober', 'November', 'Desember'];
+
+function syncAll() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) return;
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const reports = readTable_(ss.getSheetByName(REPORT_SHEET));
+    const items = readTable_(ss.getSheetByName(ITEM_SHEET));
+    const map = getMapSheet_(ss);
+
+    // Map sheet columns: ID | FileId | Signature | XlsxId
+    const known = {};
+    map.getDataRange().getValues().slice(1).forEach((m, i) => {
+      known[m[0]] = { row: i + 2, fileId: m[1], signature: m[2], xlsxId: m[3] };
+    });
+
+    reports.forEach(rec => {
+      const id = str_(rec['ID']);
+      if (!id) return;
+
+      const myItems = items.filter(it => str_(it['LaporanID']) === id);
+      const signature = hash_(JSON.stringify([rec, myItems]));
+      const prev = known[id];
+      if (prev && prev.signature === signature) return;   // nothing changed
+      if (!isComplete_(rec, myItems)) return;             // wait for required fields
+
+      let res;
+      try {
+        res = writeFile_(rec, myItems, prev);
+      } catch (err) {
+        console.error('Report ' + id + ' failed: ' + err);  // skip this report, keep going
+        return;
+      }
+      if (prev) {
+        map.getRange(prev.row, 2, 1, 3).setValues([[res.fileId, signature, res.xlsxId]]);
+      } else {
+        map.appendRow([id, res.fileId, signature, res.xlsxId]);
+      }
+    });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function writeFile_(rec, items, prev) {
+  const date = dateParts_(rec['Tanggal Laporan']);
+  const ymd = isoDate_(date);
+  const company = clean_(str_(rec['Perusahaan']));
+
+  const root = DriveApp.getFolderById(ROOT_FOLDER_ID);
+  const folder = getOrCreateFolder_(root, company);
+  const fileName = `${company}_${clean_(str_(rec['Nama Pekerjaan']))}_${ymd}`;
+
+  let file = getLiveFile_(prev && prev.fileId);
+  let sh;
+  if (file) {
+    // Same file, same share link: swap in a fresh copy of the template tab
+    file.setName(fileName);
+    file.moveTo(folder);
+    sh = replaceWithFreshTemplate_(file.getId());
+  } else {
+    file = DriveApp.getFileById(TEMPLATE_ID).makeCopy(fileName, folder);
+    sh = SpreadsheetApp.openById(file.getId()).getSheetByName(TEMPLATE_SHEET);
+  }
+
+  fillReport_(sh, rec, items, date);
+  SpreadsheetApp.flush();
+
+  let xlsxId = '';
+  if (EXPORT_XLSX) xlsxId = exportXlsx_(file.getId(), fileName, folder, prev && prev.xlsxId);
+  return { fileId: file.getId(), xlsxId: xlsxId };
+}
+
+function replaceWithFreshTemplate_(fileId) {
+  const target = SpreadsheetApp.openById(fileId);
+  const tpl = SpreadsheetApp.openById(TEMPLATE_ID).getSheetByName(TEMPLATE_SHEET);
+  const fresh = tpl.copyTo(target);
+  target.getSheets().forEach(s => {
+    if (s.getSheetId() !== fresh.getSheetId()) target.deleteSheet(s);
+  });
+  fresh.setName(TEMPLATE_SHEET);
+  return fresh;
+}
+
+function fillReport_(sh, rec, items, date) {
+  const n = items.length;
+  const first = FIRST_ITEM_ROW;
+  const lastTemplateRow = first + TEMPLATE_ITEM_ROWS - 1;
+
+  // 1. Resize the item block. Everything below shifts with it.
+  if (n > TEMPLATE_ITEM_ROWS) {
+    sh.insertRowsBefore(lastTemplateRow, n - TEMPLATE_ITEM_ROWS);
+  } else if (n < TEMPLATE_ITEM_ROWS) {
+    sh.deleteRows(first + n, TEMPLATE_ITEM_ROWS - n);
+  }
+  const tot = first + n;                              // totals row
+  const st = tot + 1;                                 // status row
+  const nameRow = SIGNATURE_NAME_ROW + (n - TEMPLATE_ITEM_ROWS);
+
+  // 2. Header block
+  sh.getRange('A1').setValue(safe_(str_(rec['Perusahaan'])));
+  sh.getRange('C5').setValue(safe_(str_(rec['Nama Pekerjaan'])));
+  sh.getRange('C6').setValue(safe_(str_(rec['Customer'])));
+  sh.getRange('C7').setValue(longDate_(date));
+
+  // 3. Items, sorted by date (stable for equal dates)
+  const sorted = items.slice().sort((a, b) => dateKey_(itemDate_(a, date)) - dateKey_(itemDate_(b, date)));
+  const values = sorted.map((it, i) => {
+    const income = str_(it['Jenis']) === 'Pemasukan';
+    const amount = toNumber_(it['Jumlah']) || 0;
+    const label = [str_(it['Kategori']), str_(it['Keterangan'])].filter(Boolean).join(' - ');
+    return [i + 1, shortDate_(itemDate_(it, date)), safe_(label), safe_(str_(it['Vendor'])),
+            income ? amount : 0, income ? 0 : amount, safe_(str_(it['Catatan']))];
+  });
+  const block = sh.getRange(first, 1, n, 7);
+  sh.getRange(first, 1, 1, 7).copyTo(block, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+  block.setBackgrounds(values.map((_, i) => Array(7).fill(ROW_COLORS[i % 2])));
+  sh.getRange(first, 2, n, 1).setNumberFormat('@');   // dates stay plain text, no timezone conversion
+  block.setValues(values);
+
+  // 4. Formulas, rewritten for the real row numbers
+  sh.getRange(`E${tot}`).setFormula(`=SUM(E${first}:E${tot - 1})`);
+  sh.getRange(`F${tot}`).setFormula(`=SUM(F${first}:F${tot - 1})`);
+  sh.getRange(`G${st}`).setFormula(`=F${tot}-E${tot}`);
+  sh.getRange(`E${st}`).setFormula(`=ABS(F${tot}-E${tot})`);
+  sh.getRange(`A${st}`).setFormula(
+    `=IF(G${st}>0,"STATUS: REIMBURSE / KURANG (Perlu Pembayaran Tambahan)",` +
+    `IF(G${st}<0,"STATUS: BERLEBIH / SISA (Harus Dikembalikan)","STATUS: IMPAS (Sesuai)"))`);
+
+  // 5. Signature block
+  const blank = '__________________';
+  sh.getRange(`B${nameRow}`).setValue(`( ${safe_(str_(rec['Dibuat Oleh'])) || blank} )`);
+  sh.getRange(`F${nameRow}`).setValue(`( ${safe_(str_(rec['Disetujui Oleh'])) || blank} )`);
+}
+
+function exportXlsx_(id, name, folder, oldXlsxId) {
+  const url = `https://docs.google.com/spreadsheets/d/${id}/export?format=xlsx`;
+  const blob = UrlFetchApp.fetch(url, {
+    headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken() },
+  }).getBlob().setName(name + '.xlsx');
+  if (oldXlsxId) {
+    try { DriveApp.getFileById(oldXlsxId).setTrashed(true); } catch (err) {}
+  }
+  return folder.createFile(blob).getId();
+}
+
+function isComplete_(rec, items) {
+  const ok = ['Perusahaan', 'Nama Pekerjaan', 'Tanggal Laporan'].every(k => str_(rec[k]) !== '');
+  return ok && dateParts_(rec['Tanggal Laporan']) !== null && items.length > 0;
+}
+
+function readTable_(sh) {
+  const rows = sh.getDataRange().getValues();
+  if (rows.length < 2) return [];
+  const headers = rows[0].map(h => String(h).trim());
+  return rows.slice(1).map(r => {
+    const o = {};
+    headers.forEach((h, c) => (o[h] = r[c]));
+    return o;
+  });
+}
+
+function getMapSheet_(ss) {
+  let sh = ss.getSheetByName(MAP_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(MAP_SHEET);
+    sh.appendRow(['ID', 'FileId', 'Signature', 'XlsxId']);
+  }
+  return sh;
+}
+
+function getOrCreateFolder_(parent, name) {
+  const it = parent.getFoldersByName(name);
+  return it.hasNext() ? it.next() : parent.createFolder(name);
+}
+
+function getLiveFile_(fileId) {
+  if (!fileId) return null;
+  try {
+    const f = DriveApp.getFileById(fileId);
+    return f.isTrashed() ? null : f;
+  } catch (err) {
+    return null; // the file was deleted
+  }
+}
+
+function itemDate_(it, fallback) {
+  return dateParts_(it['Tanggal']) || fallback;
+}
+
+// Returns {y, m, d} without building a JS Date, so the script timezone cannot shift the day.
+// A Date from the sheet is read in the spreadsheet's own timezone.
+function dateParts_(v) {
+  if (v instanceof Date && !isNaN(v)) {
+    const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+    const p = Utilities.formatDate(v, tz, 'yyyy-M-d').split('-').map(Number);
+    return { y: p[0], m: p[1], d: p[2] };
+  }
+  const s = String(v).trim();
+  let m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);                 // ISO text 2026-10-01
+  if (m) return { y: +m[1], m: +m[2], d: +m[3] };
+  m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})/);         // text 01/10/2026 is day/month/year
+  if (m) {
+    let d = +m[1], mo = +m[2];
+    if (mo > 12) { const t = d; d = mo; mo = t; }                    // month/day/year with a day above 12
+    return { y: +m[3], m: mo, d: d };
+  }
+  return null;
+}
+
+function toNumber_(v) {
+  if (v === '' || v === null || v === undefined) return 0;
+  if (typeof v === 'number') return v;
+  return Number(String(v).replace(',', '.')) || 0;
+}
+
+const p2_ = n => ('0' + n).slice(-2);
+function longDate_(p)  { return `${p.d} ${MONTHS[p.m - 1]} ${p.y}`; }
+function shortDate_(p) { return `${p2_(p.d)}/${p2_(p.m)}/${p.y}`; }
+function isoDate_(p)   { return `${p.y}-${p2_(p.m)}-${p2_(p.d)}`; }
+function dateKey_(p)   { return p.y * 10000 + p.m * 100 + p.d; }
+function str_(v) { return (v === undefined || v === null) ? '' : String(v).trim(); }
+function clean_(s) { return String(s).trim().replace(/[\/\\:*?"<>|]/g, '-'); }
+
+// A text that starts with = + - @ would be read as a formula
+function safe_(s) { return /^[=+\-@]/.test(s) ? "'" + s : s; }
+
+function hash_(s) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, s)
+    .map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
+```
